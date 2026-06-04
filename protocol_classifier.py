@@ -2,7 +2,6 @@
 # INSTALL IF NEEDED
 # =========================================================
 # %pip install pymupdf requests json-repair XlsxWriter
-
 import fitz  # PyMuPDF
 import requests
 import json
@@ -24,30 +23,29 @@ import xlsxwriter
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-MODEL_NAME = "google/gemma-3-4b"
+MODEL_NAME = "mrademacher/MedGemma-4B-Instruct-ft-2-GGUF"
 
-# Local Gemma stability settings.
-ENDPOINT_TEXT_CHUNK_SIZE = 6000
-SCHEDULE_TEXT_CHUNK_SIZE = 6000
-TEXT_CHUNK_OVERLAP = 250
+# Safer local-model chunk settings.
+# Smaller chunks reduce missed table rows and context errors.
+ENDPOINT_TEXT_CHUNK_SIZE = 3500
+SCHEDULE_TEXT_CHUNK_SIZE = 3500
+TEXT_CHUNK_OVERLAP = 100
 
-# Classification batching. Smaller batches are safer for local models.
-ROWS_PER_CLASSIFICATION_BATCH = 18
+# Smaller classification batches are safer for MedGemma 4B.
+ROWS_PER_CLASSIFICATION_BATCH = 5
 
 # If the TOC cannot be trusted, these limits avoid sending too many pages.
 MAX_ENDPOINT_PAGES = 18
 
 # Schedule of Activities/Assessments is usually short.
-# The code now first uses the TOC boundary:
-# Schedule section start page -> page before the next major TOC section.
-# This avoids accidentally including Introduction/Objectives/Design pages as schedule rows.
+# The code first uses the TOC boundary:
+# schedule section start page -> page before the next major TOC section.
+# It also includes relevant schedule/sampling/data-collection tables from List of Tables/bookmarks.
 MAX_SCHEDULE_PAGES = 8
 MAX_SCHEDULE_SECTION_SPAN = 5
 STRICT_TOC_SCHEDULE_SECTION_ONLY = True
 
 MAX_SUPPORTING_PAGES = 20
-
-# The output path is selected from the GUI. No hard-coded local output folder is used.
 
 
 # =========================================================
@@ -111,7 +109,6 @@ NOISE_SECTION_TERMS = [
     "publication policy",
     "confidentiality"
 ]
-
 
 VALID_CATEGORIES = [
     "primary_endpoint_related_safety",
@@ -352,7 +349,7 @@ def call_lm_studio(messages, temperature=0.0, max_tokens=1200):
         LM_STUDIO_URL,
         headers=headers,
         json=payload,
-        timeout=300
+        timeout=900
     )
 
     if response.status_code != 200:
@@ -399,6 +396,7 @@ def default_json_for_prefix(prefix):
 
     if prefix.startswith("study_map"):
         return {
+            "reference_concepts": [],
             "study_objectives": [],
             "endpoints": {
                 "primary": [],
@@ -480,6 +478,30 @@ def read_pdf_pages(pdf_path):
         for page_index, page in enumerate(doc):
             page_number = page_index + 1
             page_text = page.get_text()
+            table_text_parts = []
+
+            try:
+                tables = page.find_tables()
+
+                for table_index, table in enumerate(tables, start=1):
+                    extracted = table.extract()
+
+                    table_text_parts.append(
+                        f"\n\n--- EXTRACTED TABLE {table_index} ON PDF PAGE {page_number} ---\n"
+                    )
+
+                    for row in extracted:
+                        clean_cells = [
+                            str(cell).strip() if cell is not None else ""
+                            for cell in row
+                        ]
+                        table_text_parts.append(" | ".join(clean_cells))
+
+            except Exception:
+                pass
+
+            if table_text_parts:
+                page_text += "\n\n" + "\n".join(table_text_parts)
 
             pages.append({
                 "page_number": page_number,
@@ -506,7 +528,7 @@ def extract_pdf_bookmarks(pdf_path):
     return bookmarks
 
 
-def extract_initial_toc_text(pages, max_pages=35):
+def extract_initial_toc_text(pages, max_pages=10):
     text = ""
 
     for page in pages[:min(max_pages, len(pages))]:
@@ -533,9 +555,6 @@ def pages_to_text(pages, page_numbers):
 # =========================================================
 
 def extract_page_number_from_toc_line(line):
-    # Generic TOC format:
-    # "3.2. Endpoints....................................37"
-    # "Table 1 Schedule of Assessments ..................12"
     match = re.search(r"(\d{1,4})\s*$", line.strip())
 
     if match:
@@ -544,37 +563,18 @@ def extract_page_number_from_toc_line(line):
     return 0
 
 
-def is_toc_like_line(line):
-    stripped = line.strip()
-
-    if not stripped:
-        return False
-
-    if "." * 3 in stripped:
-        return True
-
-    if re.search(r"\.{3,}\s*\d+\s*$", stripped):
-        return True
-
-    return False
-
-
-
 def looks_like_reliable_toc_or_table_line(line):
     stripped = line.strip()
 
     if not stripped:
         return False
 
-    # Strong TOC/List of Tables evidence.
     if re.search(r"\.{3,}\s*\d{1,4}\s*$", stripped):
         return True
 
-    # Section-numbered TOC line, e.g. "3.2. Endpoints 37"
     if re.match(r"^\d+(\.\d+)*\.?\s+[A-Za-z].*\s+\d{1,4}$", stripped):
         return True
 
-    # List of Tables line, e.g. "Table 1 Schedule of Assessments 12"
     if re.match(r"^Table\s+\d+[\-\.\dA-Za-z]*\s+.+\s+\d{1,4}$", stripped, flags=re.IGNORECASE):
         return True
 
@@ -622,10 +622,8 @@ def extract_structural_candidates_from_text(toc_text, total_pages):
 
         if contains_any(title_without_page, SCHEDULE_SECTION_TERMS):
             schedule_candidates.append(dict(candidate))
-
         elif contains_any(title_without_page, ENDPOINT_SECTION_TERMS):
             endpoint_candidates.append(dict(candidate))
-
         elif contains_any(title_without_page, SUPPORTING_SECTION_TERMS):
             supporting_candidates.append(dict(candidate))
 
@@ -657,7 +655,6 @@ def extract_all_table_entries_from_toc_text(toc_text, total_pages):
             "reason": "Matched List of Tables entry."
         })
 
-    # Deduplicate by title and page.
     seen = set()
     unique_entries = []
 
@@ -689,8 +686,6 @@ def infer_table_spans(table_entries, pages, max_span=8):
             end_page = min(total_pages, start_page + max_span - 1)
 
         end_page = min(end_page, start_page + max_span - 1, total_pages)
-
-        # Stop if a new major non-table section begins, e.g. Table of Contents or abbreviations.
         refined_end_page = end_page
 
         for page_number in range(start_page + 1, end_page + 1):
@@ -721,10 +716,6 @@ def extract_numbered_toc_entries_from_text(toc_text, total_pages):
         if not line:
             continue
 
-        # Examples:
-        # "1.3 SCHEDULE OF ACTIVITIES (SOA)........13"
-        # "3 OBJECTIVES AND ENDPOINTS .............20"
-        # "8.1.2 Nasal congestion/obstruction ....45"
         match = re.match(
             r"^(\d+(?:\.\d+)*)\.?\s+(.+?)(?:\.{2,}|\s{2,}|\s+)(\d{1,4})$",
             line
@@ -758,7 +749,6 @@ def extract_numbered_toc_entries_from_text(toc_text, total_pages):
             "reason": "Matched numbered TOC section."
         })
 
-    # Deduplicate while preserving TOC order.
     unique = []
     seen = set()
 
@@ -778,14 +768,12 @@ def infer_numbered_toc_section_spans(toc_entries, total_pages, max_span=5):
     for index, entry in enumerate(toc_entries):
         start_page = int(entry["start_page"])
         level = int(entry["level"])
-
         next_boundary_page = None
 
         for next_entry in toc_entries[index + 1:]:
             next_start = int(next_entry["start_page"])
             next_level = int(next_entry["level"])
 
-            # The next section at the same or higher hierarchy closes the current section.
             if next_start > start_page and next_level <= level:
                 next_boundary_page = next_start
                 break
@@ -804,7 +792,6 @@ def infer_numbered_toc_section_spans(toc_entries, total_pages, max_span=5):
             entry.get("reason", "")
             + " End page inferred from next major TOC section and capped by MAX_SCHEDULE_SECTION_SPAN."
         )
-
         spanned_entries.append(spanned)
 
     return spanned_entries
@@ -862,74 +849,12 @@ def extract_structural_candidates_from_bookmarks(bookmarks, total_pages):
 
         if contains_any(title, SCHEDULE_SECTION_TERMS):
             schedule_candidates.append(dict(candidate))
-
         elif contains_any(title, ENDPOINT_SECTION_TERMS):
             endpoint_candidates.append(dict(candidate))
-
         elif contains_any(title, SUPPORTING_SECTION_TERMS):
             supporting_candidates.append(dict(candidate))
 
     return endpoint_candidates, schedule_candidates, supporting_candidates
-
-
-def identify_sections_from_toc_with_ai(toc_text, metadata_folder):
-    prompt = """
-You are reading the Table of Contents and List of Tables of a clinical study protocol.
-
-Your task:
-Identify page ranges for ONLY these concepts:
-1. endpoint_sections: objectives, endpoints, outcome measures.
-2. schedule_sections: schedule of assessments, schedule of activities, schedule of events, data collection schedule, sampling schedule, visit schedule.
-3. supporting_sections: safety reporting, statistical methods, data management, source data, GCP/ethics if directly useful.
-
-Do not classify anything.
-Do not analyze the protocol.
-Do not use section numbers as page numbers.
-Use actual page numbers only.
-If a section is a table from the List of Tables, include that table page.
-If a table appears to continue across following pages, estimate a short page range.
-If the end page is unclear, set end_page equal to start_page.
-Return only valid JSON.
-
-Use this exact structure:
-{
-  "endpoint_sections": [
-    {
-      "section_title": "",
-      "start_page": 0,
-      "end_page": 0,
-      "reason": ""
-    }
-  ],
-  "schedule_sections": [
-    {
-      "section_title": "",
-      "start_page": 0,
-      "end_page": 0,
-      "reason": ""
-    }
-  ],
-  "supporting_sections": [
-    {
-      "section_title": "",
-      "start_page": 0,
-      "end_page": 0,
-      "reason": ""
-    }
-  ]
-}
-"""
-
-    response = call_lm_studio(
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": toc_text}
-        ],
-        temperature=0.0,
-        max_tokens=1200
-    )
-
-    return parse_ai_json(response, metadata_folder, "toc_section_map")
 
 
 def normalize_candidate(candidate, total_pages, default_span=2, max_span=8):
@@ -1011,7 +936,6 @@ def find_header_fallback_pages(pages, terms, max_pages):
             scores.append((score, page_number))
 
     scores = sorted(scores, reverse=True)
-
     selected = set()
 
     for score, page_number in scores:
@@ -1023,25 +947,17 @@ def find_header_fallback_pages(pages, terms, max_pages):
     return sorted(selected)
 
 
-
-
 def build_target_pages(pages, bookmarks, toc_text, toc_ai_data, metadata_folder, base_name):
     total_pages = len(pages)
 
     endpoint_from_text, schedule_from_text, supporting_from_text = extract_structural_candidates_from_text(toc_text, total_pages)
     endpoint_from_bookmarks, schedule_from_bookmarks, supporting_from_bookmarks = extract_structural_candidates_from_bookmarks(bookmarks, total_pages)
 
-    # Strongest schedule targeting:
-    # Use numbered TOC section boundaries first, e.g.
-    # 1.3 Schedule of Activities starts page 13
-    # 2 Introduction starts page 16
-    # => schedule pages 13-15.
     strict_schedule_sections, numbered_toc_entries = get_strict_schedule_sections_from_numbered_toc(
         toc_text,
         total_pages
     )
 
-    # List of Tables remains useful for additional schedule/sampling tables when present.
     all_table_entries = extract_all_table_entries_from_toc_text(toc_text, total_pages)
     spanned_table_entries = infer_table_spans(all_table_entries, pages, max_span=MAX_SCHEDULE_SECTION_SPAN)
 
@@ -1056,9 +972,16 @@ def build_target_pages(pages, bookmarks, toc_text, toc_ai_data, metadata_folder,
 
     endpoint_candidates = endpoint_from_text + endpoint_from_ai + endpoint_from_bookmarks
 
+    # Important update:
+    # If a strict schedule section is found, keep it, but ALSO include schedule-related
+    # List of Tables entries and PDF bookmarks. This avoids missing sampling/data-collection tables.
     if STRICT_TOC_SCHEDULE_SECTION_ONLY and strict_schedule_sections:
-        schedule_candidates = strict_schedule_sections
-        schedule_source_mode = "strict_numbered_toc_section_boundary"
+        schedule_candidates = (
+            strict_schedule_sections
+            + schedule_table_candidates
+            + schedule_from_bookmarks
+        )
+        schedule_source_mode = "strict_numbered_toc_plus_list_of_tables_and_bookmarks"
     else:
         schedule_candidates = (
             schedule_table_candidates
@@ -1100,7 +1023,6 @@ def build_target_pages(pages, bookmarks, toc_text, toc_ai_data, metadata_folder,
         after=1
     )
 
-    # Strict fallback only if TOC/bookmark/list-of-tables targeting fails.
     if not endpoint_pages:
         endpoint_pages = find_header_fallback_pages(pages, ENDPOINT_SECTION_TERMS, MAX_ENDPOINT_PAGES)
 
@@ -1124,8 +1046,8 @@ def build_target_pages(pages, bookmarks, toc_text, toc_ai_data, metadata_folder,
         "schedule_candidates": clean_schedule_candidates,
         "supporting_candidates": clean_supporting_candidates,
         "note": (
-            "Schedule pages are now taken strictly from numbered TOC section boundaries when possible. "
-            "This prevents Schedule of Activities extraction from leaking into Introduction/Objectives/Design pages."
+            "Schedule pages are selected from strict numbered TOC when possible, "
+            "plus schedule-related List of Tables entries and PDF bookmarks."
         )
     }
 
@@ -1136,6 +1058,7 @@ def build_target_pages(pages, bookmarks, toc_text, toc_ai_data, metadata_folder,
 
     return endpoint_pages, schedule_pages, supporting_pages, diagnostics_path
 
+
 # =========================================================
 # 8. STEP 1: STUDY MAP EXTRACTION
 # =========================================================
@@ -1144,8 +1067,10 @@ STUDY_MAP_PROMPT = """
 You are analyzing the objectives/endpoints/outcome-measures section of a clinical study protocol.
 
 Task:
-Extract the study map only. Do not classify activities. Do not classify schedule rows.
-Endpoints and objectives are reference concepts only.
+Extract a unified study reference map only.
+Do not classify activities.
+Do not classify schedule rows.
+Objectives and endpoints must be treated at the same logical level as reference concepts for later activity classification.
 
 Return only valid JSON.
 Do not use markdown.
@@ -1153,33 +1078,256 @@ Do not invent information.
 
 Use this exact JSON structure:
 {
-  "study_objectives": [
+  "reference_concepts": [
     {
-      "objective_text": "",
-      "objective_type": "",
-      "endpoint_hierarchy": "",
-      "safety_or_efficacy": "",
-      "linked_endpoint": ""
+      "concept_id": "",
+      "concept_type": "",
+      "concept_text": "",
+      "hierarchy": "",
+      "domain": "",
+      "linked_objective_or_endpoint": "",
+      "reason": ""
     }
   ],
-  "endpoints": {
-    "primary": [],
-    "secondary": [],
-    "additional_or_exploratory": []
-  },
   "study_logic_notes": [
     ""
   ]
 }
 
 Rules:
-- Primary endpoints/objectives go into primary.
-- Secondary endpoints/objectives go into secondary.
-- Additional, exploratory, tertiary, descriptive, observational, or other non-primary/non-secondary endpoints/objectives go into additional_or_exploratory.
-- Determine safety_or_efficacy from the protocol wording when possible.
-- Do not classify endpoints or objectives as activities.
-- Use endpoints/objectives only as reference concepts for later activity classification.
+- Each objective and each endpoint should become a reference_concept.
+- concept_type must be one of: objective, endpoint.
+- hierarchy must be one of: primary, secondary, additional_or_exploratory, unclear.
+- domain must be one of: safety, efficacy, other, unclear.
+- Use efficacy for clinical benefit, performance, effectiveness, symptoms, survival, response, score improvement, imaging improvement, quality of life if defined as an outcome, pharmacokinetic outcome, pharmacodynamic outcome, biomarker outcome, or similar benefit/outcome concepts.
+- Use safety for adverse events, serious adverse events, adverse device effects, toxicity, tolerability, complications, laboratory safety, vital signs, ECG, physical examination, injection site reactions, pregnancy safety, risk, harm, discontinuation due to adverse events, or similar safety concepts.
+- Use other only when the endpoint/objective is clearly neither safety nor efficacy/performance.
+- Use unclear only when the protocol wording does not allow classification.
+- If an endpoint is listed under a primary efficacy objective, classify that endpoint as hierarchy=primary and domain=efficacy.
+- If an endpoint is listed under a secondary safety objective, classify that endpoint as hierarchy=secondary and domain=safety.
+- If an endpoint is listed under tertiary, exploratory, additional, descriptive, observational, or other non-primary/non-secondary objective, classify hierarchy=additional_or_exploratory.
+- Do not put schedule activities, procedures, eligibility criteria, statistics, or GCP operations in reference_concepts unless the protocol explicitly lists them as objectives or endpoints.
+- Do not classify endpoints/objectives as activities.
+- Use objectives/endpoints only as reference concepts for later activity classification.
 """
+
+
+def infer_safety_or_efficacy_from_text(text):
+    text_norm = normalize_text(text)
+
+    safety_terms = [
+        "safety", "tolerability", "adverse event", "serious adverse event",
+        "ae", "sae", "toxicity", "complication", "risk", "harm",
+        "laboratory", "lab", "vital signs", "blood pressure", "pulse",
+        "temperature", "respiratory rate", "ecg", "electrocardiogram",
+        "physical examination", "injection site", "immunogenicity",
+        "ada", "nab", "anti peg", "pregnancy", "hypersensitivity"
+    ]
+
+    efficacy_terms = [
+        "efficacy", "effectiveness", "performance", "success", "response",
+        "survival", "clinical outcome", "functional outcome", "improvement",
+        "reduction", "change from baseline", "quality of life", "exposure",
+        "concentration", "pharmacokinetic", "pharmacodynamics", "pharmacodynamic",
+        "biomarker", "auc", "cmax", "tmax", "half life", "clearance",
+        "volume of distribution", "dose proportionality", "endpoint"
+    ]
+
+    if any(normalize_text(term) in text_norm for term in safety_terms):
+        return "safety"
+
+    if any(normalize_text(term) in text_norm for term in efficacy_terms):
+        return "efficacy"
+
+    return "unknown"
+
+
+def normalize_hierarchy(value):
+    value = normalize_text(value)
+
+    if "primary" in value:
+        return "primary"
+
+    if "secondary" in value:
+        return "secondary"
+
+    if any(word in value for word in ["additional", "exploratory", "tertiary", "observational", "descriptive", "other"]):
+        return "additional_or_exploratory"
+
+    return "unclear"
+
+
+def normalize_domain(value, fallback_text=""):
+    value = normalize_text(value)
+
+    if "safety" in value:
+        return "safety"
+
+    if any(word in value for word in ["efficacy", "effectiveness", "performance", "benefit", "clinical outcome"]):
+        return "efficacy"
+
+    if "other" in value:
+        return "other"
+
+    inferred = infer_safety_or_efficacy_from_text(fallback_text)
+
+    if inferred in ["safety", "efficacy"]:
+        return inferred
+
+    return "unclear"
+
+
+def concept_from_legacy_objective(objective, concept_number):
+    objective_text = str(objective.get("objective_text", "")).strip()
+    linked = str(objective.get("linked_endpoint", "")).strip()
+    hierarchy = normalize_hierarchy(objective.get("endpoint_hierarchy", objective.get("objective_type", "")))
+    domain = normalize_domain(objective.get("safety_or_efficacy", ""), objective_text + " " + linked)
+
+    return {
+        "concept_id": f"REF_{concept_number:04d}",
+        "concept_type": "objective",
+        "concept_text": objective_text,
+        "hierarchy": hierarchy,
+        "domain": domain,
+        "linked_objective_or_endpoint": linked,
+        "reason": "Converted from legacy study_objectives structure."
+    }
+
+
+def concept_from_legacy_endpoint(endpoint, hierarchy, concept_number):
+    if isinstance(endpoint, dict):
+        endpoint_text = str(endpoint.get("endpoint_text", endpoint.get("text", endpoint))).strip()
+        linked = str(endpoint.get("linked_objective_or_endpoint", endpoint.get("linked_objective", ""))).strip()
+        domain_value = endpoint.get("domain", endpoint.get("safety_or_efficacy", ""))
+    else:
+        endpoint_text = str(endpoint).strip()
+        linked = ""
+        domain_value = ""
+
+    domain = normalize_domain(domain_value, endpoint_text + " " + linked)
+
+    return {
+        "concept_id": f"REF_{concept_number:04d}",
+        "concept_type": "endpoint",
+        "concept_text": endpoint_text,
+        "hierarchy": normalize_hierarchy(hierarchy),
+        "domain": domain,
+        "linked_objective_or_endpoint": linked,
+        "reason": "Converted from legacy endpoints structure."
+    }
+
+
+def normalize_reference_concept(concept, concept_number):
+    concept_text = str(concept.get("concept_text", "")).strip()
+
+    if not concept_text:
+        concept_text = str(
+            concept.get("objective_text", concept.get("endpoint_text", concept.get("text", "")))
+        ).strip()
+
+    concept_type = normalize_text(concept.get("concept_type", ""))
+
+    if concept_type not in ["objective", "endpoint"]:
+        if "objective" in normalize_text(concept_text):
+            concept_type = "objective"
+        else:
+            concept_type = "endpoint"
+
+    hierarchy = normalize_hierarchy(concept.get("hierarchy", concept.get("endpoint_hierarchy", "")))
+    linked = str(concept.get("linked_objective_or_endpoint", concept.get("linked_endpoint", ""))).strip()
+    domain = normalize_domain(concept.get("domain", concept.get("safety_or_efficacy", "")), concept_text + " " + linked)
+
+    concept_id = str(concept.get("concept_id", "")).strip()
+
+    if not concept_id:
+        concept_id = f"REF_{concept_number:04d}"
+
+    return {
+        "concept_id": concept_id,
+        "concept_type": concept_type,
+        "concept_text": concept_text,
+        "hierarchy": hierarchy,
+        "domain": domain,
+        "linked_objective_or_endpoint": linked,
+        "reason": str(concept.get("reason", "")).strip()
+    }
+
+
+def normalize_study_map_structure(study_map):
+    normalized = {
+        "reference_concepts": [],
+        "study_objectives": [],
+        "endpoints": {
+            "primary": [],
+            "secondary": [],
+            "additional_or_exploratory": []
+        },
+        "study_logic_notes": []
+    }
+
+    seen = set()
+    concept_number = 1
+
+    def add_concept(concept):
+        nonlocal concept_number
+
+        normalized_concept = normalize_reference_concept(concept, concept_number)
+        concept_text = normalized_concept.get("concept_text", "")
+
+        if not concept_text:
+            return
+
+        key = (
+            normalize_text(normalized_concept["concept_type"]),
+            normalize_text(normalized_concept["concept_text"]),
+            normalized_concept["hierarchy"],
+            normalized_concept["domain"]
+        )
+
+        if key in seen:
+            return
+
+        normalized_concept["concept_id"] = f"REF_{concept_number:04d}"
+        normalized["reference_concepts"].append(normalized_concept)
+        seen.add(key)
+        concept_number += 1
+
+    for concept in study_map.get("reference_concepts", []):
+        add_concept(concept)
+
+    for objective in study_map.get("study_objectives", []):
+        add_concept(concept_from_legacy_objective(objective, concept_number))
+
+    endpoints = study_map.get("endpoints", {})
+
+    for hierarchy in ["primary", "secondary", "additional_or_exploratory"]:
+        for endpoint in endpoints.get(hierarchy, []):
+            add_concept(concept_from_legacy_endpoint(endpoint, hierarchy, concept_number))
+
+    for concept in normalized["reference_concepts"]:
+        if concept["concept_type"] == "objective":
+            normalized["study_objectives"].append({
+                "objective_text": concept["concept_text"],
+                "objective_type": concept["hierarchy"],
+                "endpoint_hierarchy": concept["hierarchy"],
+                "safety_or_efficacy": concept["domain"],
+                "linked_endpoint": concept["linked_objective_or_endpoint"]
+            })
+
+        if concept["concept_type"] == "endpoint" and concept["hierarchy"] in normalized["endpoints"]:
+            normalized["endpoints"][concept["hierarchy"]].append({
+                "endpoint_text": concept["concept_text"],
+                "domain": concept["domain"],
+                "linked_objective_or_endpoint": concept["linked_objective_or_endpoint"]
+            })
+
+    for note in study_map.get("study_logic_notes", []):
+        note = str(note).strip()
+
+        if note and note not in normalized["study_logic_notes"]:
+            normalized["study_logic_notes"].append(note)
+
+    return normalized
 
 
 def extract_study_map(endpoint_text, metadata_folder):
@@ -1198,13 +1346,14 @@ def extract_study_map(endpoint_text, metadata_folder):
                 {"role": "user", "content": chunk}
             ],
             temperature=0.0,
-            max_tokens=1000
+            max_tokens=1600
         )
 
         parsed = parse_ai_json(response, metadata_folder, f"study_map_chunk_{i}")
         partial_maps.append(parsed)
 
-    merged = {
+    merged_raw = {
+        "reference_concepts": [],
         "study_objectives": [],
         "endpoints": {
             "primary": [],
@@ -1216,25 +1365,28 @@ def extract_study_map(endpoint_text, metadata_folder):
 
     def add_unique(target, items):
         seen = set(json.dumps(item, sort_keys=True) for item in target)
+
         for item in items:
             key = json.dumps(item, sort_keys=True)
+
             if key not in seen:
                 target.append(item)
                 seen.add(key)
 
     for partial in partial_maps:
-        add_unique(merged["study_objectives"], partial.get("study_objectives", []))
+        add_unique(merged_raw["reference_concepts"], partial.get("reference_concepts", []))
+        add_unique(merged_raw["study_objectives"], partial.get("study_objectives", []))
 
         endpoints = partial.get("endpoints", {})
-        add_unique(merged["endpoints"]["primary"], endpoints.get("primary", []))
-        add_unique(merged["endpoints"]["secondary"], endpoints.get("secondary", []))
-        add_unique(merged["endpoints"]["additional_or_exploratory"], endpoints.get("additional_or_exploratory", []))
+        add_unique(merged_raw["endpoints"]["primary"], endpoints.get("primary", []))
+        add_unique(merged_raw["endpoints"]["secondary"], endpoints.get("secondary", []))
+        add_unique(merged_raw["endpoints"]["additional_or_exploratory"], endpoints.get("additional_or_exploratory", []))
 
         for note in partial.get("study_logic_notes", []):
-            if note and note not in merged["study_logic_notes"]:
-                merged["study_logic_notes"].append(note)
+            if note and note not in merged_raw["study_logic_notes"]:
+                merged_raw["study_logic_notes"].append(note)
 
-    return merged
+    return normalize_study_map_structure(merged_raw)
 
 
 # =========================================================
@@ -1298,7 +1450,7 @@ def extract_schedule_rows(schedule_text, metadata_folder):
                 {"role": "user", "content": chunk}
             ],
             temperature=0.0,
-            max_tokens=1200
+            max_tokens=2200
         )
 
         parsed = parse_ai_json(response, metadata_folder, f"schedule_rows_chunk_{i}")
@@ -1426,86 +1578,11 @@ def normalize_classification(value):
     return mapping.get(value, "not_classifiable")
 
 
-def infer_safety_or_efficacy_from_text(text):
-    text_norm = normalize_text(text)
-
-    safety_terms = [
-        "safety", "tolerability", "adverse event", "serious adverse event",
-        "ae", "sae", "toxicity", "complication", "risk", "harm",
-        "laboratory", "lab", "vital signs", "blood pressure", "pulse",
-        "temperature", "respiratory rate", "ecg", "electrocardiogram",
-        "physical examination", "injection site", "immunogenicity",
-        "ada", "nab", "anti peg", "pregnancy", "hypersensitivity"
-    ]
-
-    efficacy_terms = [
-        "efficacy", "effectiveness", "performance", "success", "response",
-        "survival", "clinical outcome", "functional outcome", "improvement",
-        "reduction", "change from baseline", "quality of life", "exposure",
-        "concentration", "pharmacokinetic", "pharmacodynamics", "pharmacodynamic",
-        "biomarker", "auc", "cmax", "tmax", "half life", "clearance",
-        "volume of distribution", "dose proportionality", "endpoint"
-    ]
-
-    if any(normalize_text(term) in text_norm for term in safety_terms):
-        return "safety"
-
-    if any(normalize_text(term) in text_norm for term in efficacy_terms):
-        return "efficacy"
-
-    return "unknown"
-
-
-def build_endpoint_reference_index(study_map):
-    references = []
-
-    endpoints = study_map.get("endpoints", {})
-
-    for hierarchy in ["primary", "secondary", "additional_or_exploratory"]:
-        for endpoint in endpoints.get(hierarchy, []):
-            endpoint_text = str(endpoint)
-            nature = infer_safety_or_efficacy_from_text(endpoint_text)
-
-            references.append({
-                "hierarchy": hierarchy,
-                "nature": nature,
-                "text": endpoint_text,
-                "terms": extract_match_terms(endpoint_text)
-            })
-
-    for objective in study_map.get("study_objectives", []):
-        objective_text = str(objective.get("objective_text", ""))
-        hierarchy = str(objective.get("endpoint_hierarchy", "")).strip().lower()
-        nature = str(objective.get("safety_or_efficacy", "")).strip().lower()
-
-        if "primary" in hierarchy:
-            hierarchy = "primary"
-        elif "secondary" in hierarchy:
-            hierarchy = "secondary"
-        elif any(word in hierarchy for word in ["exploratory", "additional", "tertiary", "other", "observational", "descriptive"]):
-            hierarchy = "additional_or_exploratory"
-        else:
-            continue
-
-        if nature not in ["safety", "efficacy"]:
-            nature = infer_safety_or_efficacy_from_text(objective_text + " " + str(objective.get("linked_endpoint", "")))
-
-        references.append({
-            "hierarchy": hierarchy,
-            "nature": nature,
-            "text": objective_text,
-            "terms": extract_match_terms(objective_text + " " + str(objective.get("linked_endpoint", "")))
-        })
-
-    return references
-
-
 def extract_match_terms(text):
     text = str(text)
-    text = re.sub(r"[\u2022•]", ",", text)
+    text = re.sub(r"[\u2022*]", ",", text)
 
     chunks = re.split(r"[,;:\n]|\band\b|\bor\b|\(|\)", text, flags=re.IGNORECASE)
-
     terms = []
 
     for chunk in chunks:
@@ -1515,7 +1592,6 @@ def extract_match_terms(text):
         if len(cleaned_norm) < 4:
             continue
 
-        # Avoid useless generic words.
         if cleaned_norm in [
             "endpoint", "endpoints", "objective", "objectives", "variables",
             "assessment", "assessments", "profile", "properties", "parameters"
@@ -1527,13 +1603,11 @@ def extract_match_terms(text):
 
         terms.append(cleaned)
 
-    # Include the full text if it is short.
     full_norm = normalize_text(text)
 
     if 1 <= len(full_norm.split()) <= 12:
         terms.append(text.strip())
 
-    # Add light singular/plural variants only through normalized comparison later.
     unique = []
     seen = set()
 
@@ -1547,6 +1621,30 @@ def extract_match_terms(text):
     return unique
 
 
+def build_endpoint_reference_index(study_map):
+    references = []
+    normalized_map = normalize_study_map_structure(study_map)
+
+    for concept in normalized_map.get("reference_concepts", []):
+        concept_text = str(concept.get("concept_text", "")).strip()
+        linked = str(concept.get("linked_objective_or_endpoint", "")).strip()
+
+        if not concept_text:
+            continue
+
+        references.append({
+            "concept_id": concept.get("concept_id", ""),
+            "concept_type": concept.get("concept_type", ""),
+            "hierarchy": concept.get("hierarchy", "unclear"),
+            "nature": concept.get("domain", "unclear"),
+            "text": concept_text,
+            "linked_objective_or_endpoint": linked,
+            "terms": extract_match_terms(concept_text + " " + linked)
+        })
+
+    return references
+
+
 def term_matches_activity(term, activity_text):
     term_norm = normalize_text(term)
     activity_norm = normalize_text(activity_text)
@@ -1557,14 +1655,12 @@ def term_matches_activity(term, activity_text):
     if len(term_norm) < 4:
         return False
 
-    # Direct phrase match either way.
     if term_norm in activity_norm:
         return True
 
     if activity_norm in term_norm and len(activity_norm.split()) >= 2:
         return True
 
-    # Token overlap for multi-word terms.
     term_tokens = [t for t in term_norm.split() if len(t) >= 4]
     activity_tokens = set(t for t in activity_norm.split() if len(t) >= 4)
 
@@ -1609,7 +1705,6 @@ def deterministic_activity_classification(activity_text, study_map):
                     "reason_for_classification": "Matched activity to endpoint/objective reference map."
                 }
 
-    # GCP fallback after endpoint matching.
     activity_norm = normalize_text(activity_text)
 
     for gcp_category, activities in GCP_REFERENCE_ACTIVITIES.items():
@@ -1641,15 +1736,12 @@ def apply_deterministic_classification_review(classified_items, study_map):
         if deterministic:
             current = normalize_classification(item.get("classification", "not_classifiable"))
 
-            # Override only when deterministic mapping is stronger than missing/not_classifiable/GCP.
-            # This prevents obvious endpoint rows such as AE assessments from staying not_classifiable.
             if current in ["not_classifiable", "general_study_operations_related_to_gcp"]:
                 item["classification"] = deterministic["classification"]
                 item["linked_endpoint_or_requirement"] = deterministic["linked_endpoint_or_requirement"]
                 item["reason_for_classification"] = deterministic["reason_for_classification"]
 
         item["classification"] = normalize_classification(item.get("classification", "not_classifiable"))
-
         reviewed.append(item)
 
     return reviewed
@@ -1660,6 +1752,8 @@ def build_endpoint_presence_summary(study_map):
 
     has_safety = any(ref.get("nature") == "safety" for ref in references)
     has_efficacy = any(ref.get("nature") == "efficacy" for ref in references)
+    has_other = any(ref.get("nature") == "other" for ref in references)
+    has_unclear = any(ref.get("nature") == "unclear" for ref in references)
     has_primary = any(ref.get("hierarchy") == "primary" for ref in references)
     has_secondary = any(ref.get("hierarchy") == "secondary" for ref in references)
     has_additional = any(ref.get("hierarchy") == "additional_or_exploratory" for ref in references)
@@ -1671,6 +1765,12 @@ def build_endpoint_presence_summary(study_map):
 
     if not has_efficacy:
         notes.append("No efficacy/performance endpoint/objective was clearly identified in the extracted study map.")
+
+    if has_other:
+        notes.append("At least one reference concept was identified as other because it was neither clearly safety nor efficacy/performance.")
+
+    if has_unclear:
+        notes.append("At least one reference concept had unclear safety/efficacy domain based on the extracted text.")
 
     if not has_primary:
         notes.append("No primary endpoint/objective was clearly identified in the extracted study map.")
@@ -1687,6 +1787,8 @@ def build_endpoint_presence_summary(study_map):
     return {
         "has_safety_endpoint_or_objective": has_safety,
         "has_efficacy_or_performance_endpoint_or_objective": has_efficacy,
+        "has_other_endpoint_or_objective": has_other,
+        "has_unclear_domain_endpoint_or_objective": has_unclear,
         "has_primary_endpoint_or_objective": has_primary,
         "has_secondary_endpoint_or_objective": has_secondary,
         "has_additional_or_exploratory_endpoint_or_objective": has_additional,
@@ -1714,7 +1816,7 @@ def classify_schedule_rows(schedule_rows, study_map, metadata_folder):
                 {"role": "user", "content": json.dumps(user_payload, indent=2, ensure_ascii=False)}
             ],
             temperature=0.0,
-            max_tokens=1400
+            max_tokens=1600
         )
 
         parsed = parse_ai_json(response, metadata_folder, f"classification_batch_{batch_number}")
@@ -1725,7 +1827,6 @@ def classify_schedule_rows(schedule_rows, study_map, metadata_folder):
             for item in batch_items
         }
 
-        # Guarantee one output per input row, even if Gemma missed or failed a row.
         for row in batch:
             row_id = str(row.get("row_id", "")).strip()
             item = batch_by_id.get(row_id)
@@ -1773,7 +1874,6 @@ def classify_schedule_rows(schedule_rows, study_map, metadata_folder):
             classified.append(item)
 
     classified = apply_deterministic_classification_review(classified, study_map)
-
     return classified
 
 
@@ -1790,7 +1890,6 @@ def calculate_metrics(classified_items):
         counts[classification] += 1
 
     total = len(classified_items)
-
     percentages = {}
 
     for category in VALID_CATEGORIES:
@@ -1804,7 +1903,6 @@ def calculate_metrics(classified_items):
         },
         "percentages": percentages
     }
-
 
 
 def build_qc_checks(study_map, schedule_rows, classified_items, endpoint_pages, schedule_pages):
@@ -1864,6 +1962,7 @@ def build_qc_checks(study_map, schedule_rows, classified_items, endpoint_pages, 
 
     return checks
 
+
 # =========================================================
 # 12. EXCEL OUTPUT
 # =========================================================
@@ -1898,7 +1997,6 @@ def write_excel_output(output_excel_path, analysis_data):
 
     metrics = analysis_data.get("metrics", {})
 
-    # Summary
     ws = workbook.add_worksheet("Summary")
     ws.set_column("A:A", 45)
     ws.set_column("B:B", 18)
@@ -1910,7 +2008,6 @@ def write_excel_output(output_excel_path, analysis_data):
     ws.write("C3", "Percentage", header_format)
 
     row = 3
-
     counts = metrics.get("counts", {})
     percentages = metrics.get("percentages", {})
 
@@ -1944,46 +2041,47 @@ def write_excel_output(output_excel_path, analysis_data):
     ws.write("B18", str(endpoint_summary.get("has_secondary_endpoint_or_objective", "")), cell_format)
     ws.write("A19", "Additional/exploratory endpoint/objective detected", header_format)
     ws.write("B19", str(endpoint_summary.get("has_additional_or_exploratory_endpoint_or_objective", "")), cell_format)
-
-    ws.write("A21", "Endpoint Map Notes", header_format)
+    ws.write("A20", "Other endpoint/objective domain detected", header_format)
+    ws.write("B20", str(endpoint_summary.get("has_other_endpoint_or_objective", "")), cell_format)
+    ws.write("A21", "Unclear endpoint/objective domain detected", header_format)
+    ws.write("B21", str(endpoint_summary.get("has_unclear_domain_endpoint_or_objective", "")), cell_format)
+    ws.write("A23", "Endpoint Map Notes", header_format)
     notes = endpoint_summary.get("summary_notes", [])
-    ws.write("B21", " | ".join(str(note) for note in notes), cell_format)
+    ws.write("B23", " | ".join(str(note) for note in notes), cell_format)
 
-
-    # Study Map
     ws = workbook.add_worksheet("Study Map")
-    ws.set_column("A:A", 30)
-    ws.set_column("B:B", 100)
-    ws.set_column("C:C", 35)
-    ws.set_column("D:D", 35)
-    ws.set_column("E:E", 100)
+    ws.set_column("A:A", 14)
+    ws.set_column("B:B", 18)
+    ws.set_column("C:C", 100)
+    ws.set_column("D:D", 24)
+    ws.set_column("E:E", 20)
+    ws.set_column("F:F", 100)
+    ws.set_column("G:G", 80)
 
-    headers = ["Map Type", "Text", "Hierarchy", "Safety/Efficacy", "Linked Endpoint"]
+    headers = [
+        "Concept ID",
+        "Concept Type",
+        "Reference Concept Text",
+        "Hierarchy",
+        "Safety/Efficacy Domain",
+        "Linked Objective or Endpoint",
+        "Reason"
+    ]
+
     for col, header in enumerate(headers):
         ws.write(0, col, header, header_format)
 
-    study_map = analysis_data.get("study_map", {})
-    row = 1
+    study_map = normalize_study_map_structure(analysis_data.get("study_map", {}))
 
-    for objective in study_map.get("study_objectives", []):
-        ws.write(row, 0, "objective", cell_format)
-        ws.write(row, 1, str(objective.get("objective_text", "")), cell_format)
-        ws.write(row, 2, str(objective.get("endpoint_hierarchy", "")), cell_format)
-        ws.write(row, 3, str(objective.get("safety_or_efficacy", "")), cell_format)
-        ws.write(row, 4, str(objective.get("linked_endpoint", "")), cell_format)
-        row += 1
+    for row_idx, concept in enumerate(study_map.get("reference_concepts", []), start=1):
+        ws.write(row_idx, 0, concept.get("concept_id", ""), cell_format)
+        ws.write(row_idx, 1, concept.get("concept_type", ""), cell_format)
+        ws.write(row_idx, 2, concept.get("concept_text", ""), cell_format)
+        ws.write(row_idx, 3, concept.get("hierarchy", ""), cell_format)
+        ws.write(row_idx, 4, concept.get("domain", ""), cell_format)
+        ws.write(row_idx, 5, concept.get("linked_objective_or_endpoint", ""), cell_format)
+        ws.write(row_idx, 6, concept.get("reason", ""), cell_format)
 
-    endpoints = study_map.get("endpoints", {})
-    for hierarchy in ["primary", "secondary", "additional_or_exploratory"]:
-        for endpoint in endpoints.get(hierarchy, []):
-            ws.write(row, 0, "endpoint", cell_format)
-            ws.write(row, 1, str(endpoint), cell_format)
-            ws.write(row, 2, hierarchy, cell_format)
-            ws.write(row, 3, "", cell_format)
-            ws.write(row, 4, "", cell_format)
-            row += 1
-
-    # Extracted Schedule Rows
     ws = workbook.add_worksheet("Extracted Schedule Rows")
     ws.set_column("A:A", 14)
     ws.set_column("B:B", 45)
@@ -2004,7 +2102,6 @@ def write_excel_output(output_excel_path, analysis_data):
         ws.write(row_idx, 4, item.get("visit_or_timepoint", ""), cell_format)
         ws.write(row_idx, 5, item.get("raw_row_text", ""), cell_format)
 
-    # Classified Activities
     ws = workbook.add_worksheet("Classified Activities")
     ws.set_column("A:A", 14)
     ws.set_column("B:B", 45)
@@ -2038,7 +2135,6 @@ def write_excel_output(output_excel_path, analysis_data):
         ws.write(row_idx, 6, item.get("linked_endpoint_or_requirement", ""), cell_format)
         ws.write(row_idx, 7, item.get("reason_for_classification", ""), cell_format)
 
-    # QC Checks
     ws = workbook.add_worksheet("QC Checks")
     ws.set_column("A:A", 42)
     ws.set_column("B:B", 20)
@@ -2053,7 +2149,6 @@ def write_excel_output(output_excel_path, analysis_data):
         ws.write(row_idx, 1, check.get("status", ""), cell_format)
         ws.write(row_idx, 2, check.get("details", ""), cell_format)
 
-    # Metadata
     ws = workbook.add_worksheet("Metadata")
     ws.set_column("A:A", 38)
     ws.set_column("B:B", 120)
@@ -2074,9 +2169,7 @@ def write_excel_output(output_excel_path, analysis_data):
 
 def run_full_analysis(pdf_path, output_root, update_callback):
     base_name = safe_folder_name(pdf_path)
-
     archive_root = archive_previous_run_folders(output_root, base_name, update_callback)
-
     paths = create_output_paths(pdf_path, output_root)
 
     base_name = paths["base_name"]
@@ -2099,14 +2192,22 @@ def run_full_analysis(pdf_path, output_root, update_callback):
         json.dump(bookmarks, f, indent=4, ensure_ascii=False)
 
     update_callback("Extracting TOC/List of Tables text...")
-    toc_text = extract_initial_toc_text(pages, max_pages=35)
+    toc_text = extract_initial_toc_text(pages, max_pages=10)
 
     toc_text_path = os.path.join(metadata_folder, f"{base_name}_toc_text.txt")
     with open(toc_text_path, "w", encoding="utf-8") as f:
         f.write(toc_text)
 
-    update_callback("Finding endpoint and schedule pages from TOC...")
-    toc_ai_data = identify_sections_from_toc_with_ai(toc_text, metadata_folder)
+    update_callback("Finding endpoint and schedule pages from TOC/bookmarks...")
+
+    # Important update:
+    # Skip AI TOC parsing for speed and stability.
+    # Deterministic TOC parsing, List of Tables extraction, and PDF bookmarks are used instead.
+    toc_ai_data = {
+        "endpoint_sections": [],
+        "schedule_sections": [],
+        "supporting_sections": []
+    }
 
     endpoint_pages, schedule_pages, supporting_pages, targeting_diagnostics_path = build_target_pages(
         pages=pages,
@@ -2140,25 +2241,24 @@ def run_full_analysis(pdf_path, output_root, update_callback):
     if not schedule_text.strip():
         raise RuntimeError("No schedule text was extracted. Check metadata targeting diagnostics.")
 
-    update_callback("Step 1: extracting endpoint/objective reference map...")
+    update_callback("Step 1: extracting endpoint/objective reference map. This can take several minutes...")
     study_map = extract_study_map(endpoint_text, metadata_folder)
 
     study_map_path = os.path.join(metadata_folder, f"{base_name}_study_map.json")
     with open(study_map_path, "w", encoding="utf-8") as f:
         json.dump(study_map, f, indent=4, ensure_ascii=False)
 
-    update_callback("Step 2: extracting schedule/activity rows...")
+    update_callback("Step 2: extracting schedule/activity rows. This can take several minutes...")
     schedule_rows = extract_schedule_rows(schedule_text, metadata_folder)
 
     schedule_rows_path = os.path.join(metadata_folder, f"{base_name}_schedule_rows.json")
     with open(schedule_rows_path, "w", encoding="utf-8") as f:
         json.dump(schedule_rows, f, indent=4, ensure_ascii=False)
 
-    update_callback("Step 3: classifying schedule/activity rows...")
+    update_callback("Step 3: classifying schedule/activity rows. This can take several minutes...")
     classified_items = classify_schedule_rows(schedule_rows, study_map, metadata_folder)
 
     metrics = calculate_metrics(classified_items)
-
     endpoint_presence_summary = build_endpoint_presence_summary(study_map)
 
     qc_checks = build_qc_checks(
@@ -2218,7 +2318,6 @@ def run_full_analysis(pdf_path, output_root, update_callback):
     write_excel_output(output_excel_path, analysis_data)
 
     update_callback("Analysis complete.")
-
     return output_excel_path, output_json_path, metadata_folder, run_folder
 
 
@@ -2337,7 +2436,6 @@ instruction_label = tk.Label(
     text=(
         "Workflow: TOC -> endpoint/objective reference map -> schedule/activity row extraction -> "
         "classification of each activity against endpoints or GCP. "
-        "Endpoints/objectives are not classified as activities."
     ),
     font=("Arial", 11),
     wraplength=820
